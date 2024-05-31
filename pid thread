@@ -1,0 +1,554 @@
+from ast import Dict
+import sys
+import time
+from flask import Flask, jsonify, request as flask_request, Response, after_this_request
+from flask_cors import CORS
+import threading
+import queue
+import os
+import uuid
+from gptinterfacer import (
+    build_context,
+    build_modifiers,
+    build_persona,
+    build_request,
+    build_prompt,
+)
+from langchain.chat_models import ChatOpenAI
+from langchain.document_loaders.csv_loader import CSVLoader
+from langchain.memory import ConversationBufferMemory
+from langchain.callbacks.streaming_stdout import StreamingStdOutCallbackHandler
+from langchain.schema import HumanMessage
+from langchain.chains import LLMChain
+from langchain_core.outputs import LLMResult              
+from langchain.prompts import PromptTemplate
+from dotenv import dotenv_values
+import pandas as pd
+import logging
+from werkzeug.utils import secure_filename
+import pymongo
+import atexit
+from datetime import datetime
+from pymongo.errors import PyMongoError
+from json.decoder import JSONDecodeError
+from threading import Event
+from typing import Dict, Any, List
+import os, signal
+global g
+
+
+MONGO_URL="mongodb+srv://polarisdbadmin:db-devp0lar1$@polaris-dev.jccse.mongodb.net/test?authSource=admin&replicaSet=atlas-b31xfo-shard-0&readPreference=primary&ssl=true"
+MONGO_DBNAME="test"
+PROMPTS_COLLECTION="Prompts"
+REQUEST_COLLECTION="Requests"
+PERSONA_COLLECTION="Persona"
+MODIFIER_COLLECTION="Modifier"
+
+client = pymongo.MongoClient(MONGO_URL)
+atexit.register(client.close)
+polarisdb = client[MONGO_DBNAME]
+prompt_db = polarisdb[PROMPTS_COLLECTION]
+request_db = polarisdb[REQUEST_COLLECTION]
+persona_db = polarisdb[PERSONA_COLLECTION]
+modifier_db = polarisdb[MODIFIER_COLLECTION]
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler("api.log"),logging.StreamHandler(sys.stdout)
+        ])
+
+app = Flask(__name__)
+CORS(app, resources={r"/*": {"origins": "*"}})
+
+memory = ConversationBufferMemory(memory_key="default")
+g = None
+
+# Load Variables from .env
+config = dotenv_values(".env")
+OPENAI_API_KEY = config.get("OPENAI_API_KEY")
+UPLOAD_PATH = config.get("UPLOAD_PATH")
+
+ALLOWED_EXTENSIONS = {"csv"}
+
+
+def allowed_file(filename):
+    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    return "OK", 200
+
+
+@app.route("/v2/prompt", methods=["POST"])
+def buildPrompt():
+    data = flask_request.json
+    container = data.get("container")
+    description = data.get("description")
+    time_period = data.get("time_period")
+    time_period_value = data.get("time_period_value")
+    organization = data.get("organization")
+    industry = data.get("industry")
+    service_lines = data.get("service_lines")
+    locations = data.get("locations")
+    regions = data.get("regions")
+    services = data.get("services")
+    user_request = data.get("request")
+    modifier = data.get("modifier")
+    persona = data.get("persona")
+
+    prompt = build_prompt(
+        container=container,
+        description=description,
+        time_period=time_period,
+        time_period_value=time_period_value,
+        organization=organization,
+        industry=industry,
+        service_lines=service_lines,
+        services=services,
+        request=user_request,
+        modifier=modifier,
+        persona=persona,
+        locations=locations,
+        regions=regions,
+    )
+
+    logging.info("prompt ---------------------------%s",prompt)
+    return jsonify({"prompt": prompt})
+
+@app.route("/clear-container", methods=["POST"])
+@app.route("/v2/clear-container", methods=["POST"])
+def clear_container():
+    try:
+        data = flask_request.json
+        container = data.get("container")  # Get the container name
+        # Delete all documents in the Prompts collection for the specified container
+        result = prompt_db.delete_many({"container": container})
+        
+
+        if result.deleted_count > 0:
+            logging.info(f"Cleared {result.deleted_count} prompts for container '{container}'")
+            return jsonify({"message": f"Cleared {result.deleted_count} prompts for container '{container}'"}), 200
+        else:
+            logging.info(f"No prompts found for container '{container}'")
+            return jsonify({"message": f"No prompts found for container '{container}'"}), 200
+
+    except PyMongoError as pe:
+        return jsonify({"error": f"MongoDB Query Error: {pe}"}), 500
+
+    # except (JSONDecodeError, ValueError, TypeError) as ve:
+    #     return jsonify({"error": f"Invalid Input: {ve}"}), 400
+
+    # except Exception as e:
+    #     return jsonify({"error": f"An unexpected error occurred: {e}"}), 500
+
+
+
+@app.route("/previous-prompts/container", methods=["POST"])
+@app.route("/v2/previous-prompts/container", methods=["POST"])
+def previous_prompts():
+    try:
+        data = flask_request.json
+        container = data.get("container") # Get the container name
+        # Query the Prompts collection to find the previous prompts and responses for the specified container
+        previous_prompts = list(prompt_db.find({"container": container}).sort("timestamp", pymongo.ASCENDING).limit(10))
+
+        # Prepare the response data
+        response_data = {"memorykey": "", "history": []}
+        for prompt in previous_prompts:
+            response_data["history"].append({
+                "prompt": prompt["prompt"],
+                "response": prompt["Resopnse"],
+                "timestamp": prompt["timestamp"]
+            })
+
+            # Set the memory key for the response data
+
+        if previous_prompts:
+            response_data["memorykey"] = previous_prompts[0]["memoryKey"]
+            # Log the successful retrieval of previous prompts
+            logging.info(f"Successfully retrieved previous prompts for container '{container}'")
+
+        # Return the response data as JSON
+        return jsonify(response_data)
+    
+    except Exception as e:
+        # Log any exceptions that occur during the processing of the route
+        logging.error(f"Error in /previous-prompts/container route: {str(e)}")
+        # Return an error response
+        return jsonify({"error": "An unexpected error occurred"}), 500
+
+
+@app.route("/v2/chat", methods=["POST"])
+def chat():
+    data = flask_request.json
+    prompt = data.get("prompt")
+    memory_key = data.get("memory_key") if data.get("memory_key") is not None else str(uuid.uuid1())
+    dashboard_json = data.get("data_payload")
+    temperature=data.get("temperature",0.1)
+    container = data.get("container") # Get the container name
+   
+
+    global memory
+    res = Response(chain(prompt, dashboard_json, memory_key,temperature), mimetype="text/event-stream")
+    res.headers["X-Accel-Buffering"] = "no"
+    print("response on setting x accel buffering-------------------",res)
+    logging.info("response from chat-----------------------%s",res)
+
+    # store_prompt(memory_key, prompt)
+    @after_this_request
+    def store_prompt_after_request(response):
+        store_prompt(memory_key, prompt,container)
+        return response
+
+    return res
+
+def store_prompt(memory_key, prompt,container=None):
+
+    # Check if the prompt already exists in the collection
+    existing_prompt = prompt_db.find_one({"prompt": prompt})
+    if not existing_prompt:
+        timestamp = datetime.now()
+        doc = {'memoryKey' : memory_key, 'prompt':prompt,"container":container, 'timestamp':timestamp}
+        prompt_db.insert_one(doc)
+
+    else:
+        logging.info("Prompt already exists in the collection.")
+
+@app.route("/getPrompt", methods=["GET"])
+@app.route("/v2/getPrompt", methods=["GET"])
+def getPrompt():
+    try:
+        
+        pageNumber = flask_request.args.get("pageNumber", type=int)
+        nPerPage = flask_request.args.get("nPerPage", type=int)
+
+        # Validate input parameters
+        if pageNumber is None or nPerPage is None or pageNumber < 1 or nPerPage < 1:
+            raise ValueError("The value of input parameters 'pageNumber' or 'nPerPage' is invalid.")
+
+        skip_value = (pageNumber - 1) * nPerPage if pageNumber > 0 else 0
+        all_prompt = list(prompt_db.find({}, {"_id": 0}).sort('_id', pymongo.ASCENDING).skip(skip_value).limit(nPerPage))
+       
+
+        return jsonify({"all_prompt": all_prompt}), 200
+    
+    except PyMongoError as pe:
+        return jsonify({"error": f"MongoDB Query Error: {pe}"}), 500
+
+    
+
+@app.route("/addPromptComponents", methods=["POST"])
+@app.route("/v2/addPromptComponents", methods=["POST"])
+def addPromptComponents():
+    data = flask_request.json
+    component = data.get("component").lower()
+    compValue = data.get("compValue").lower()
+
+    componentDict={
+        "persona" : persona_db,
+        "request" : request_db,
+        "modifier" : modifier_db,
+    }
+
+    record=componentDict.get(component).find_one({component:compValue})
+    if record:
+        logging.info(f"{component} already exists.")
+        return jsonify({"error" : f"{component} already exists."}), 409
+    else:
+        doc = {component : compValue,'isCommon':False}
+        componentDict.get(component).insert_one(doc)
+        return jsonify({"Message": "The doc is inserted successfully"}), 200
+
+@app.route("/getPromptComponents", methods=["GET"])
+@app.route("/v2/getPromptComponents", methods=["GET"])
+def getPromptComponents():
+    try:
+        component = flask_request.args.get("component", type=str)
+        if component=="persona":
+            result = list(persona_db.find({},{"_id": 0,"isCommon":0,"userId":0}))
+            persona_list=[item["persona"].title() for item in result]
+            return jsonify({"Message": "The persona-list is fetched successfully","res":persona_list}), 200  
+        elif component=="request":
+            result = list(request_db.find({},{"_id": 0,"isCommon":0,"userId":0}))
+            request_list=[item["request"].title() for item in result]
+            return jsonify({"Message": "The request-list is fetched successfully","res":request_list}), 200
+        elif component=="modifier":
+            result = list(modifier_db.find({},{"_id": 0,"isCommon":0,"userId":0}))
+            modifier_list=[item["modifier"].title() for item in result]
+            return jsonify({"Message": "The modifier-list is fetched successfully","res":modifier_list}), 200
+        else:
+            raise ValueError("The value of 'component' is invalid.")
+    except PyMongoError as pe:
+        return jsonify({"error": f"MongoDB Query Error: {pe}"}), 500
+
+    except (JSONDecodeError, ValueError, TypeError) as ve:
+        return jsonify({"error": f"Invalid Input: {ve}"}), 400
+    
+    except Exception as e:
+        return jsonify({"error": f"An unexpected error occurred: {e}"}), 500
+    
+
+@app.route("/v2/stop_streaming", methods=["POST"])
+@app.route("/stop_streaming", methods=["POST"])
+def stop_streaming():
+        # global g
+        data = flask_request.json
+        streams = data.get('condition')
+        tread = threading.Event()
+        print('lkwjedlkwjdwljddkw',list(os.popen(f"ps -eLf | grep {streams}")), threading.current_thread().getName())
+        # try:
+        while True:
+            try:
+                for line in os.popen(f"ps -eLf | grep {streams}"): 
+                    print(line)
+                    fields = line.split()
+                    
+                    # extracting Process ID from the output
+                    pid = fields[1] 
+                    print("pid", pid)
+                    print("pid", pid)
+                    # terminating process 
+                    # if
+                    os.kill(int(pid), signal.SIGKILL) 
+                    print("Process Successfully terminated")
+            except:
+                pass
+    #     if g is not None:
+    #         g.close()
+            # g = None
+        logging.info("Inside if condition  of  stop_streaming function after closing the threadGenerator")
+        return jsonify({"message": "Streaming will stop-aproach1"}), 200
+            # else:
+            #     logging.info("Inside else condition of stop_streaming function")
+            #     return jsonify({"error": "No active streaming session found"}), 404
+        # except Exception as e:
+        #     return jsonify({"error": f"An unexpected error occurred: {e}"}), 500
+
+   
+
+@app.route("/prompt", methods=["POST"])
+def buildPrompt1():                                 
+    data = flask_request.json
+    user_request = data.get("request")
+    organization = data.get("organization")
+    service_lines = data.get("service_lines")
+    locations = data.get("locations")
+    regions = data.get("regions")
+
+    if user_request == "RATING":
+        modifier = data.get("modifier")
+        persona = data.get("persona")
+        # For the "Rating" request, create a specific prompt based on user input
+        prompt = f"Evaluate the digital marketing performance of an {organization} providing {service_lines} services at {locations},{regions}. Please provide a star rating on a scale of 1 to 5, and explain the factors influencing the rating."
+    else:
+        container = data.get("container")
+        description = data.get("description")
+        time_period = data.get("time_period")
+        time_period_value = data.get("time_period_value")
+        organization = data.get("organization")
+        industry = data.get("industry")
+        service_lines = data.get("service_lines")
+        locations = data.get("locations")
+        regions = data.get("regions")
+        services = data.get("services")
+        modifier = data.get("modifier")
+        persona = data.get("persona")
+        # For other requests, use PromptTemplate to generate prompts
+        prompt = build_prompt(
+            container=container,
+            description=description,
+            time_period=time_period,
+            time_period_value=time_period_value,
+            organization=organization,
+            industry=industry,
+            service_lines=service_lines,
+            locations=locations,
+            regions=regions,
+            services=services,
+            request=user_request,
+            modifier=modifier,
+            persona=persona,
+        )
+
+    return jsonify({"prompt": prompt}), 200
+
+@app.route("/upload", methods=["POST"])
+def uploadCSV():
+    if flask_request.method == "POST":
+        if "file" not in flask_request.files:
+            return (
+                jsonify({"error": "No file part", "message": "Internal Server Error"}),
+                500,
+            )
+        file = flask_request.files["file"]
+
+        if file.filename == "":
+            return (
+                jsonify(
+                    {"error": "No selected file", "message": "Internal Server Error"}
+                ),
+                500,
+            )
+        if file and allowed_file(file.filename):
+            # Generate a unique filename using a UUID
+            unique_filename = str(uuid.uuid4()) + " " + secure_filename(file.filename)
+            file.save(os.path.join(UPLOAD_PATH, unique_filename))
+            return (
+                jsonify(
+                    {
+                        "code": 200,
+                        "message": "File Uploaded Successfully",
+                        "details": {"file": unique_filename},
+                    }
+                ),
+                200,
+            )
+        else:
+            return (
+                jsonify(
+                    {"error": "Invalid file format", "message": "Internal Server Error"}
+                ),
+                500,
+            )
+        
+@app.route("/chat", methods=["POST"])
+def get():
+    data = flask_request.json
+    prompt = data.get("prompt")
+    memory_key = data.get("memory_key") if data.get("memory_key") is not None else uuid.uuid1()
+    temperature=data.get("temperature",0.1)
+
+    csv = None
+    if data.get("filename") is not None:
+        filename = data.get("filename")
+        file = open(os.path.join(UPLOAD_PATH, filename))
+        csv = file.read()
+
+    res = Response(chain(prompt,  csv, memory_key,temperature), mimetype="text/event-stream")
+    res.headers["X-Accel-Buffering"] = "no"
+    return  res
+
+
+class ThreadedGenerator:
+    def __init__(self):
+        self.queue = queue.Queue()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        item = self.queue.get()
+        if item is StopIteration:
+            raise item
+        return item
+
+    def send(self, data):
+        self.queue.put(data)
+
+    def close(self):
+        self.queue.put(StopIteration)
+
+
+class ChainStreamHandler(StreamingStdOutCallbackHandler):
+    def __init__(self, gen, memory_key,):
+        super().__init__()
+        self.gen = gen
+        self.memory_key = str(memory_key)
+        self.ai_response=""
+
+    def on_llm_new_token(self, token: str, **kwargs):
+
+        if(token):
+            print("token",token)
+            self.gen.send(token)
+            self.ai_response+=token
+            
+
+    def on_llm_end(self, response: LLMResult, **kwargs):
+        
+        tokenappended =  f"{'::mem:key:pol:ai::'}{self.memory_key}" 
+        self.gen.send(tokenappended)
+                # Define the filter to find the document to update
+        filter_criteria = {"memoryKey": self.memory_key}
+        # Define the update operation (for example, setting a new field)s
+        update_operation = {"$set": {"Resopnse": self.ai_response}}
+        prompt_db.update_one(filter_criteria,update_operation )
+
+        
+    def on_llm_error(self, error: BaseException, **kwargs):
+        # Handle the error here, you can log it and send it to the frontend
+        error_message = f"{''}{str(error)}"
+        # logging.info("llm error-----------",error_message)
+        print(f"LLM Error: {error_message}")
+        # Send the error message to the frontend
+        self.gen.send(error_message)
+        # Log the detailed error message
+        logging.error(f"LLM Error: {error_message}")
+
+def llm_thread(g, prompt, data, memory_key,temperature,error=None):
+    try:
+        chat = ChatOpenAI(
+            # model_name="gpt-4-1106-preview",
+            model_name="gpt-4-turbo-preview",
+            verbose=True,
+            streaming=True,
+            callbacks=[ChainStreamHandler(g,memory_key)],
+            temperature=temperature,
+        )
+        if data is not None:
+            # Modify the promptTemplate to include the processed datas...
+            promptTemplate = """{prompt}
+            
+            ###{data}
+            """
+            prompt_template = PromptTemplate(
+                input_variables=["prompt", "data"],
+                template=promptTemplate,
+            )
+            chat_llm_chain = LLMChain(llm=chat, prompt=prompt_template)
+            chat_llm_chain.run(
+                prompt=prompt,
+                data=data,
+                memory_key=memory_key,
+                timeout=60
+            )
+        else:
+            # Handle the case where data is None
+            promptTemplate = """{prompt}
+            """
+            prompt_template = PromptTemplate(
+                input_variables=["prompt"],
+                template=promptTemplate,
+            )
+            chat_llm_chain = LLMChain(llm=chat, prompt=prompt_template)
+            chat_llm_chain.run(prompt=prompt, memory_key=memory_key)
+        
+    except Exception as e:
+        if error is not None:
+            g.send(error)
+        else:
+            g.send(f"Error in llm_thread: {str(e)}")
+        
+    finally:
+        g.close()
+
+
+def chain(prompt, data, memory_key,temperature,error=None):
+  
+    g = ThreadedGenerator()
+    threading.Thread(target=llm_thread, args=(g, prompt, data, memory_key,temperature,error), name='t1').start()
+    return g
+
+@app.route("/reset-conversation", methods=["POST"])
+def reset_conversation():
+    global memory
+    memory.clear()
+    return jsonify({"message": "Conversation reset successfully"})
+
+
+if __name__ == "__main__":
+    app.run(debug=True, host="0.0.0.0", port=5000)
